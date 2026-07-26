@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<title>Road Trip Companion</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+  html, body { background: #0B0F14; color: #F2F5F7;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }
+  #root { max-width: 640px; margin: 0 auto; padding: 16px 14px 40px; min-height: 100vh; }
+  button { font-family: inherit; cursor: pointer; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<!-- React from CDN — no build step needed -->
+<script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script crossorigin src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel">
+/* ============================================================================
+   ROAD TRIP COMPANION — single-file build
+   ----------------------------------------------------------------------------
+   ▼▼▼ PASTE YOUR GOOGLE API KEY BETWEEN THE QUOTES ON THE NEXT LINE ▼▼▼        */
+   const API_KEY = "AIzaSyAfUMqPeo2pJH0tdPnykrYBC1MXYuftIrY";
+/* ▲▲▲ that is the ONLY thing you edit in this file ▲▲▲
+
+   The key must be restricted (in Google Cloud Console) to:
+     • Websites: https://dancin8bear5.github.io/*
+     • APIs: Places API (New) + Distance Matrix API
+   A restricted client-side key is safe to ship this way.
+   ========================================================================== */
+
+const { useState, useEffect, useCallback, useMemo, useRef } = React;
+
+// If the key hasn't been pasted yet, run in DEMO mode with fake data so the
+// page still renders instead of erroring. Real key => real data.
+const HAS_KEY = API_KEY && API_KEY !== "PASTE_YOUR_KEY_HERE";
+
+// Forward corridor: a stop must be within this many degrees of your heading.
+const AHEAD_CONE = 45;
+// How far out to look for stops (meters). 80km ≈ 50mi — plenty of runway.
+const SEARCH_RADIUS_M = 80000;
+
+const DEFAULT_FAVORITES = [
+  { id: "bucees", label: "Buc-ee's", keyword: "Buc-ee's", icon: "🦫" },
+  { id: "loves",  label: "Love's",   keyword: "Love's Travel Stop", icon: "❤️" },
+  { id: "pilot",  label: "Pilot",    keyword: "Pilot travel center", icon: "✈️" },
+  { id: "gas",    label: "Nearest Gas", keyword: "gas station", icon: "⛽" },
+  { id: "mcd",    label: "McDonald's", keyword: "McDonald's", icon: "🍟" },
+  { id: "sonic",  label: "Sonic",    keyword: "Sonic Drive-In", icon: "🌭" },
+  { id: "rest",   label: "Rest Area", keyword: "rest area", icon: "🚻" },
+];
+
+const PRESET_STOPS = [
+  { id: "bucees", label: "Buc-ee's", keyword: "Buc-ee's", icon: "🦫" },
+  { id: "loves",  label: "Love's",   keyword: "Love's Travel Stop", icon: "❤️" },
+  { id: "pilot",  label: "Pilot",    keyword: "Pilot travel center", icon: "✈️" },
+  { id: "flyingj",label: "Flying J", keyword: "Flying J travel center", icon: "🛫" },
+  { id: "gas",    label: "Nearest Gas", keyword: "gas station", icon: "⛽" },
+  { id: "mcd",    label: "McDonald's", keyword: "McDonald's", icon: "🍟" },
+  { id: "sonic",  label: "Sonic",    keyword: "Sonic Drive-In", icon: "🌭" },
+  { id: "cfa",    label: "Chick-fil-A", keyword: "Chick-fil-A", icon: "🐔" },
+  { id: "cracker",label: "Cracker Barrel", keyword: "Cracker Barrel", icon: "🪵" },
+  { id: "food",   label: "Any Food", keyword: "restaurant", icon: "🍽️" },
+  { id: "rest",   label: "Rest Area", keyword: "rest area", icon: "🚻" },
+  { id: "coffee", label: "Coffee",   keyword: "coffee", icon: "☕" },
+  { id: "ev",     label: "EV Charging", keyword: "EV charging station", icon: "🔌" },
+];
+
+// --------------------------------------------------------------------------
+// MATH
+// --------------------------------------------------------------------------
+function bearingDeg(lat1, lng1, lat2, lng2) {
+  const toRad = d => d * Math.PI / 180, toDeg = r => r * 180 / Math.PI;
+  const dLng = toRad(lng2 - lng1);
+  const y = Math.sin(dLng) * Math.cos(toRad(lat2));
+  const x = Math.cos(toRad(lat1)) * Math.sin(toRad(lat2)) -
+            Math.sin(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.cos(dLng);
+  return (toDeg(Math.atan2(y, x)) + 360) % 360;
+}
+function angleDelta(a, b) { const d = Math.abs(a - b) % 360; return d > 180 ? 360 - d : d; }
+function isAhead(heading, stopBearing) {
+  if (heading == null || Number.isNaN(heading)) return true;
+  return angleDelta(heading, stopBearing) <= AHEAD_CONE;
+}
+
+// --------------------------------------------------------------------------
+// DATA — real Google calls
+// --------------------------------------------------------------------------
+
+// 1) Find the nearest place matching each keyword (Places API New — Text Search).
+async function findPlace(fav, lat, lng) {
+  const res = await fetch("https://places.googleapis.com/v1/places:searchText", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": API_KEY,
+      "X-Goog-FieldMask": "places.displayName,places.location,places.formattedAddress",
+    },
+    body: JSON.stringify({
+      textQuery: fav.keyword,
+      locationBias: { circle: { center: { latitude: lat, longitude: lng }, radius: SEARCH_RADIUS_M } },
+      maxResultCount: 1,
+    }),
+  });
+  if (!res.ok) throw new Error("Places " + res.status);
+  const data = await res.json();
+  const p = data.places && data.places[0];
+  if (!p) return { ...fav, found: false, miles: null, placeName: null };
+  return {
+    ...fav, found: true,
+    placeName: p.displayName ? p.displayName.text : fav.label,
+    address: p.formattedAddress || "",
+    lat: p.location.latitude, lng: p.location.longitude,
+    stopBearing: bearingDeg(lat, lng, p.location.latitude, p.location.longitude),
+  };
+}
+
+// 2) Get REAL DRIVING distance to all found stops in one Distance Matrix call.
+//    This is the fix for "distances were wildly off" — road miles, not straight line.
+async function addDrivingDistances(stops, lat, lng) {
+  const found = stops.filter(s => s.found);
+  if (found.length === 0) return stops;
+  const origins = `${lat},${lng}`;
+  const destinations = found.map(s => `${s.lat},${s.lng}`).join("|");
+  const url = "https://maps.googleapis.com/maps/api/distancematrix/json"
+    + `?origins=${origins}&destinations=${encodeURIComponent(destinations)}`
+    + `&units=imperial&key=${API_KEY}`;
+  const res = await fetch(url);
+  const data = await res.json();
+  const elements = (data.rows && data.rows[0] && data.rows[0].elements) || [];
+  const byId = {};
+  found.forEach((s, i) => {
+    const el = elements[i];
+    if (el && el.status === "OK") {
+      byId[s.id] = {
+        miles: +(el.distance.value / 1609.34).toFixed(1), // meters → miles
+        driveText: el.duration.text,                        // e.g. "18 mins"
+      };
+    }
+  });
+  return stops.map(s => byId[s.id] ? { ...s, ...byId[s.id] } : s);
+}
+
+async function fetchLivePlaces(favorites, lat, lng) {
+  const found = await Promise.all(favorites.map(f =>
+    findPlace(f, lat, lng).catch(() => ({ ...f, found: false, miles: null, placeName: null }))
+  ));
+  return addDrivingDistances(found, lat, lng);
+}
+
+// DEMO fallback (no key yet): deterministic so it never flickers on toggle.
+function seededUnit(str) {
+  let h = 2166136261;
+  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 16777619); }
+  return ((h >>> 0) % 100000) / 100000;
+}
+function fetchDemoPlaces(favorites) {
+  return favorites.map(fav => {
+    const r1 = seededUnit(fav.id + "d"), r2 = seededUnit(fav.id + "b");
+    const miles = +(r1 * 50 + 2).toFixed(1);
+    const stopBearing = Math.floor(r2 * 360);
+    return { ...fav, found: true, placeName: fav.label + " (demo)",
+      miles, driveText: Math.round(miles * 1.1) + " min", stopBearing,
+      lat: 36.1 + Math.cos(stopBearing*Math.PI/180)*(miles/69),
+      lng: -86.7 + Math.sin(stopBearing*Math.PI/180)*(miles/69) };
+  });
+}
+
+// --------------------------------------------------------------------------
+// APP
+// --------------------------------------------------------------------------
+function App() {
+  const [favorites, setFavorites] = useState(DEFAULT_FAVORITES);
+  const [places, setPlaces] = useState([]);   // raw, frozen between fetches
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState(null);
+  const [lastUpdated, setLastUpdated] = useState(null);
+  const [view, setView] = useState("main");
+  const [coords, setCoords] = useState(null);
+  const [heading, setHeading] = useState(null);
+  const [aheadOnly, setAheadOnly] = useState(true);
+  const timer = useRef(null);
+
+  const effectiveHeading = HAS_KEY ? heading : 0;
+
+  const refresh = useCallback(async () => {
+    setLoading(true); setErr(null);
+    try {
+      let results;
+      if (HAS_KEY) {
+        if (!coords) { setLoading(false); return; }
+        results = await fetchLivePlaces(favorites, coords.lat, coords.lng);
+      } else {
+        results = fetchDemoPlaces(favorites);
+      }
+      setPlaces(results);
+      setLastUpdated(new Date());
+    } catch (e) {
+      setErr(e.message || "Something went wrong");
+    }
+    setLoading(false);
+  }, [favorites, coords]);
+
+  // Location + heading
+  useEffect(() => {
+    if (!navigator.geolocation) { setErr("No location available"); return; }
+    const id = navigator.geolocation.watchPosition(
+      pos => {
+        setCoords({ lat: pos.coords.latitude, lng: pos.coords.longitude });
+        if (pos.coords.heading != null && pos.coords.speed > 1) setHeading(pos.coords.heading);
+        else setHeading(null);
+      },
+      () => setErr("Location permission needed"),
+      { enableHighAccuracy: true, timeout: 10000 }
+    );
+    return () => navigator.geolocation.clearWatch(id);
+  }, []);
+
+  // Fetch on load + when coords first arrive, then every 90s.
+  useEffect(() => {
+    refresh();
+    timer.current = setInterval(refresh, 90000);
+    return () => clearInterval(timer.current);
+  }, [refresh]);
+
+  // View = filter + sort derived from frozen data; toggling never refetches.
+  const visible = useMemo(() => {
+    const withAhead = places.map(p => ({
+      ...p, ahead: p.miles == null ? true : isAhead(effectiveHeading, p.stopBearing),
+    }));
+    const filtered = aheadOnly ? withAhead.filter(p => p.ahead) : withAhead;
+    return [...filtered].sort((a, b) => {
+      if (a.miles == null) return 1;
+      if (b.miles == null) return -1;
+      return a.miles - b.miles;
+    });
+  }, [places, aheadOnly, effectiveHeading]);
+
+  const openDirections = (p) => {
+    if (p.lat == null) return;
+    window.open(`https://maps.apple.com/?daddr=${p.lat},${p.lng}`, "_blank");
+  };
+  const toggleFav = (stop) => setFavorites(prev =>
+    prev.some(f => f.id === stop.id) ? prev.filter(f => f.id !== stop.id) : [...prev, stop]);
+
+  // ---- SETTINGS ----
+  if (view === "settings") {
+    return (
+      <div>
+        <div style={st.setHead}>
+          <button style={st.back} onClick={() => { setView("main"); refresh(); }}>‹ Back</button>
+          <h1 style={st.setTitle}>Stops</h1><div style={{width:60}} />
+        </div>
+        <p style={st.hint}>Tap to add or remove. Nearest shows first while you drive.</p>
+        <div style={st.list}>
+          {PRESET_STOPS.map(s => {
+            const on = favorites.some(f => f.id === s.id);
+            return (
+              <button key={s.id} onClick={() => toggleFav(s)}
+                style={{...st.row, ...(on ? st.rowOn : {})}}>
+                <span style={{fontSize:26}}>{s.icon}</span>
+                <span style={st.rowLabel}>{s.label}</span>
+                <span style={st.check}>{on ? "✓" : "+"}</span>
+              </button>
+            );
+          })}
+        </div>
+      </div>
+    );
+  }
+
+  // ---- MAIN ----
+  return (
+    <div>
+      <div style={st.top}>
+        <div>
+          <div style={st.name}>ROAD TRIP</div>
+          <div style={st.sub}>
+            {!HAS_KEY ? "Demo mode — add API key" :
+             err ? "⚠ " + err :
+             lastUpdated ? "Updated " + lastUpdated.toLocaleTimeString([], {hour:"numeric",minute:"2-digit"}) : "…"}
+          </div>
+        </div>
+        <div style={{display:"flex",gap:8}}>
+          <button style={st.icon} onClick={refresh}>↻</button>
+          <button style={st.icon} onClick={() => setView("settings")}>⚙</button>
+        </div>
+      </div>
+
+      <button style={{...st.chip, ...(aheadOnly ? st.chipOn : {})}}
+        onClick={() => setAheadOnly(v => !v)}>
+        {aheadOnly ? "▲ On your route" : "◇ All directions"}
+        <span style={st.chipHint}>
+          {aheadOnly ? "only stops on the road ahead" : "including behind & off-route"}
+        </span>
+      </button>
+
+      {loading && visible.length === 0 && <div style={st.empty}>Finding stops…</div>}
+      {!loading && err && <div style={st.empty}>⚠ {err}<br/><span style={{fontSize:14}}>Tap ↻ to retry</span></div>}
+      {!loading && !err && places.length === 0 && <div style={st.empty}>No stops set. Tap ⚙ to add some.</div>}
+      {!loading && !err && places.length > 0 && visible.length === 0 && aheadOnly &&
+        <div style={st.empty}>Nothing on the road ahead. Tap the filter for all directions.</div>}
+
+      <div style={st.grid}>
+        {visible.map((p, i) => (
+          <button key={p.id}
+            style={{...st.tile, ...(i===0 ? st.tileTop : {}), ...(p.miles==null ? st.tileNone : {})}}
+            onClick={() => openDirections(p)} disabled={p.miles==null}>
+            {i===0 && p.miles!=null && <div style={st.flag}>NEXT UP</div>}
+            <div style={{fontSize:38}}>{p.icon}</div>
+            <div style={st.label}>{p.label}</div>
+            {p.miles!=null
+              ? <div><span style={st.miles}>{p.miles}</span><span style={st.mi}> mi</span>
+                  {p.driveText && <div style={st.drive}>{p.driveText}</div>}</div>
+              : <div style={st.noneTxt}>none nearby</div>}
+            {p.miles!=null && <div style={st.go}>Tap → directions</div>}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+const st = {
+  top: { display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 },
+  name: { fontSize:24, fontWeight:800, letterSpacing:2, color:"#FFC24B" },
+  sub: { fontSize:13, color:"#6B7A88", marginTop:2 },
+  icon: { width:48, height:48, borderRadius:14, border:"none", background:"#1A222C", color:"#F2F5F7", fontSize:22 },
+  chip: { width:"100%", display:"flex", flexDirection:"column", alignItems:"flex-start", gap:2,
+    background:"#1A222C", border:"2px solid #22303C", borderRadius:12, padding:"10px 14px",
+    marginBottom:14, color:"#8A97A3", fontSize:15, fontWeight:700 },
+  chipOn: { background:"#13251C", border:"2px solid #2ECC71", color:"#2ECC71" },
+  chipHint: { fontSize:12, fontWeight:500, color:"#6B7A88" },
+  grid: { display:"grid", gridTemplateColumns:"1fr 1fr", gap:12 },
+  tile: { background:"#151C24", border:"2px solid #22303C", borderRadius:20, padding:"18px 14px 16px",
+    textAlign:"center", color:"#F2F5F7", display:"flex", flexDirection:"column", alignItems:"center",
+    minHeight:150, justifyContent:"center", position:"relative" },
+  tileTop: { background:"#13251C", border:"2px solid #2ECC71", gridColumn:"1 / -1", minHeight:170 },
+  tileNone: { opacity:0.45 },
+  flag: { position:"absolute", top:12, left:14, fontSize:12, fontWeight:800, letterSpacing:1.5, color:"#2ECC71" },
+  label: { fontSize:18, fontWeight:700, margin:"4px 0" },
+  miles: { fontSize:46, fontWeight:800, color:"#FFC24B", lineHeight:1 },
+  mi: { fontSize:18, fontWeight:600, color:"#8A97A3" },
+  drive: { fontSize:14, color:"#8A97A3", marginTop:2 },
+  noneTxt: { fontSize:16, color:"#8A97A3", marginTop:6 },
+  go: { fontSize:12, color:"#5C6B78", marginTop:8 },
+  empty: { textAlign:"center", padding:"50px 20px", color:"#6B7A88", fontSize:18 },
+  setHead: { display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:8 },
+  setTitle: { fontSize:22, fontWeight:800 },
+  back: { background:"none", border:"none", color:"#FFC24B", fontSize:18, fontWeight:600, width:60, textAlign:"left" },
+  hint: { color:"#6B7A88", fontSize:14, marginBottom:16 },
+  list: { display:"flex", flexDirection:"column", gap:10 },
+  row: { display:"flex", alignItems:"center", gap:14, background:"#151C24", border:"2px solid #22303C",
+    borderRadius:14, padding:"14px 16px", color:"#F2F5F7" },
+  rowOn: { border:"2px solid #2ECC71", background:"#13251C" },
+  rowLabel: { fontSize:18, fontWeight:600, flex:1, textAlign:"left" },
+  check: { fontSize:22, fontWeight:800, color:"#2ECC71" },
+};
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+</script>
+</body>
+</html>
